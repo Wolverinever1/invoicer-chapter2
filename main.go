@@ -236,8 +236,33 @@ func createCSRFToken() string {
 	mac.Write(msg)
 	return base64.StdEncoding.EncodeToString(msg) + `$` + base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }
+const defaultUser string = "samantha"
+const defaultPass string = "1ns3cur3"
+
+func requestBasicAuth(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="invoicer"`)
+	w.WriteHeader(401)
+	w.Write([]byte(`please authenticate`))
+}
 
 func (iv *invoicer) getIndex(w http.ResponseWriter, r *http.Request) {
+	if len(r.Header.Get("Authorization")) < 8 || r.Header.Get("Authorization")[0:5] != `Basic` {
+		requestBasicAuth(w)
+		return
+	}
+	authbytes, err := base64.StdEncoding.DecodeString(r.Header.Get("Authorization")[6:])
+	if err != nil {
+		requestBasicAuth(w)
+		return
+	}
+	
+	authstr := fmt.Sprintf("%s", authbytes)
+	username := authstr[0:strings.Index(authstr, ":")]
+	password := authstr[strings.Index(authstr, ":")+1:]
+	if username != defaultUser && password != defaultPass {
+		requestBasicAuth(w)
+		return
+	}
 	w.Header().Add("Content-Security-Policy", "default-src 'self';")
 	w.Header().Add("X-Frame-Options", "SAMEORIGIN")
 	log.Println("serving index page")
