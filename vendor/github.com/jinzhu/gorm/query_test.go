@@ -41,6 +41,24 @@ func TestFirstAndLast(t *testing.T) {
 	}
 }
 
+func TestQueryWithAssociation(t *testing.T) {
+	user := &User{Name: "user1", Emails: []Email{{Email: "user1@example.com"}}, Company: Company{Name: "company"}}
+
+	if err := DB.Create(&user).Error; err != nil {
+		t.Fatalf("errors happened when create user: %v", err)
+	}
+
+	user.CreatedAt = time.Time{}
+	user.UpdatedAt = time.Time{}
+	if err := DB.Where(&user).First(&User{}).Error; err != nil {
+		t.Errorf("search with struct with association should returns no error, but got %v", err)
+	}
+
+	if err := DB.Where(user).First(&User{}).Error; err != nil {
+		t.Errorf("search with struct with association should returns no error, but got %v", err)
+	}
+}
+
 func TestFirstAndLastWithNoStdPrimaryKey(t *testing.T) {
 	DB.Save(&Animal{Name: "animal1"})
 	DB.Save(&Animal{Name: "animal2"})
@@ -87,6 +105,37 @@ func TestUIntPrimaryKey(t *testing.T) {
 	}
 }
 
+func TestCustomizedTypePrimaryKey(t *testing.T) {
+	type ID uint
+	type CustomizedTypePrimaryKey struct {
+		ID   ID
+		Name string
+	}
+
+	DB.AutoMigrate(&CustomizedTypePrimaryKey{})
+
+	p1 := CustomizedTypePrimaryKey{Name: "p1"}
+	p2 := CustomizedTypePrimaryKey{Name: "p2"}
+	p3 := CustomizedTypePrimaryKey{Name: "p3"}
+	DB.Create(&p1)
+	DB.Create(&p2)
+	DB.Create(&p3)
+
+	var p CustomizedTypePrimaryKey
+
+	if err := DB.First(&p, p2.ID).Error; err == nil {
+		t.Errorf("Should return error for invalid query condition")
+	}
+
+	if err := DB.First(&p, "id = ?", p2.ID).Error; err != nil {
+		t.Errorf("No error should happen when querying with customized type for primary key, got err %v", err)
+	}
+
+	if p.Name != "p2" {
+		t.Errorf("Should find correct value when querying with customized type for primary key")
+	}
+}
+
 func TestStringPrimaryKeyForNumericValueStartingWithZero(t *testing.T) {
 	type AddressByZipCode struct {
 		ZipCode string `gorm:"primary_key"`
@@ -99,7 +148,7 @@ func TestStringPrimaryKeyForNumericValueStartingWithZero(t *testing.T) {
 	var address AddressByZipCode
 	DB.First(&address, "00501")
 	if address.ZipCode != "00501" {
-		t.Errorf("Fetch a record from with a string primary key for a numeric value starting with zero should work, but failed")
+		t.Errorf("Fetch a record from with a string primary key for a numeric value starting with zero should work, but failed, zip code is %v", address.ZipCode)
 	}
 }
 
@@ -150,17 +199,17 @@ func TestSearchWithPlainSQL(t *testing.T) {
 
 	scopedb.Where("birthday > ?", parseTime("2000-1-1")).Find(&users)
 	if len(users) != 2 {
-		t.Errorf("Should found 2 users's birthday > 2000-1-1, but got %v", len(users))
+		t.Errorf("Should found 2 users' birthday > 2000-1-1, but got %v", len(users))
 	}
 
 	scopedb.Where("birthday > ?", "2002-10-10").Find(&users)
 	if len(users) != 2 {
-		t.Errorf("Should found 2 users's birthday >= 2002-10-10, but got %v", len(users))
+		t.Errorf("Should found 2 users' birthday >= 2002-10-10, but got %v", len(users))
 	}
 
 	scopedb.Where("birthday >= ?", "2010-1-1").Where("birthday < ?", "2020-1-1").Find(&users)
 	if len(users) != 1 {
-		t.Errorf("Should found 1 users's birthday < 2020-1-1 and >= 2010-1-1, but got %v", len(users))
+		t.Errorf("Should found 1 users' birthday < 2020-1-1 and >= 2010-1-1, but got %v", len(users))
 	}
 
 	DB.Where("name in (?)", []string{user1.Name, user2.Name}).Find(&users)
@@ -188,6 +237,36 @@ func TestSearchWithPlainSQL(t *testing.T) {
 
 	if DB.Where("name = ?", "none existing").Find(&[]User{}).RecordNotFound() {
 		t.Errorf("Should not get RecordNotFound error when looking for none existing records")
+	}
+}
+
+func TestSearchWithTwoDimensionalArray(t *testing.T) {
+	var users []User
+	user1 := User{Name: "2DSearchUser1", Age: 1, Birthday: parseTime("2000-1-1")}
+	user2 := User{Name: "2DSearchUser2", Age: 10, Birthday: parseTime("2010-1-1")}
+	user3 := User{Name: "2DSearchUser3", Age: 20, Birthday: parseTime("2020-1-1")}
+	DB.Create(&user1)
+	DB.Create(&user2)
+	DB.Create(&user3)
+
+	if dialect := DB.Dialect().GetName(); dialect == "mysql" || dialect == "postgres" {
+		if err := DB.Where("(name, age) IN (?)", [][]interface{}{{"2DSearchUser1", 1}, {"2DSearchUser2", 10}}).Find(&users).Error; err != nil {
+			t.Errorf("No error should happen when query with 2D array, but got %v", err)
+
+			if len(users) != 2 {
+				t.Errorf("Should find 2 users with 2D array, but got %v", len(users))
+			}
+		}
+	}
+
+	if dialect := DB.Dialect().GetName(); dialect == "mssql" {
+		if err := DB.Joins("JOIN (VALUES ?) AS x (col1, col2) ON x.col1 = name AND x.col2 = age", [][]interface{}{{"2DSearchUser1", 1}, {"2DSearchUser2", 10}}).Find(&users).Error; err != nil {
+			t.Errorf("No error should happen when query with 2D array, but got %v", err)
+
+			if len(users) != 2 {
+				t.Errorf("Should find 2 users with 2D array, but got %v", len(users))
+			}
+		}
 	}
 }
 
@@ -389,10 +468,78 @@ func TestOffset(t *testing.T) {
 		DB.Save(&User{Name: fmt.Sprintf("OffsetUser%v", i)})
 	}
 	var users1, users2, users3, users4 []User
-	DB.Limit(100).Order("age desc").Find(&users1).Offset(3).Find(&users2).Offset(5).Find(&users3).Offset(-1).Find(&users4)
+	DB.Limit(100).Where("name like ?", "OffsetUser%").Order("age desc").Find(&users1).Offset(3).Find(&users2).Offset(5).Find(&users3).Offset(-1).Find(&users4)
 
 	if (len(users1) != len(users4)) || (len(users1)-len(users2) != 3) || (len(users1)-len(users3) != 5) {
 		t.Errorf("Offset should work")
+	}
+}
+
+func TestLimitAndOffsetSQL(t *testing.T) {
+	user1 := User{Name: "TestLimitAndOffsetSQL1", Age: 10}
+	user2 := User{Name: "TestLimitAndOffsetSQL2", Age: 20}
+	user3 := User{Name: "TestLimitAndOffsetSQL3", Age: 30}
+	user4 := User{Name: "TestLimitAndOffsetSQL4", Age: 40}
+	user5 := User{Name: "TestLimitAndOffsetSQL5", Age: 50}
+	if err := DB.Save(&user1).Save(&user2).Save(&user3).Save(&user4).Save(&user5).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name          string
+		limit, offset interface{}
+		users         []*User
+		ok            bool
+	}{
+		{
+			name:   "OK",
+			limit:  float64(2),
+			offset: float64(2),
+			users: []*User{
+				&User{Name: "TestLimitAndOffsetSQL3", Age: 30},
+				&User{Name: "TestLimitAndOffsetSQL2", Age: 20},
+			},
+			ok: true,
+		},
+		{
+			name:   "Limit parse error",
+			limit:  float64(1000000), // 1e+06
+			offset: float64(2),
+			ok:     false,
+		},
+		{
+			name:   "Offset parse error",
+			limit:  float64(2),
+			offset: float64(1000000), // 1e+06
+			ok:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var users []*User
+			err := DB.Where("name LIKE ?", "TestLimitAndOffsetSQL%").Order("age desc").Limit(tt.limit).Offset(tt.offset).Find(&users).Error
+			if tt.ok {
+				if err != nil {
+					t.Errorf("error expected nil, but got %v", err)
+				}
+				if len(users) != len(tt.users) {
+					t.Errorf("users length expected %d, but got %d", len(tt.users), len(users))
+				}
+				for i := range tt.users {
+					if users[i].Name != tt.users[i].Name {
+						t.Errorf("users[%d] name expected %s, but got %s", i, tt.users[i].Name, users[i].Name)
+					}
+					if users[i].Age != tt.users[i].Age {
+						t.Errorf("users[%d] age expected %d, but got %d", i, tt.users[i].Age, users[i].Age)
+					}
+				}
+			} else {
+				if err == nil {
+					t.Error("error expected not nil, but got nil")
+				}
+			}
+		})
 	}
 }
 
@@ -430,6 +577,15 @@ func TestCount(t *testing.T) {
 	if count1 != 1 || count2 != 3 {
 		t.Errorf("Multiple count in chain")
 	}
+
+	var count3 int
+	if err := DB.Model(&User{}).Where("name in (?)", []string{user2.Name, user2.Name, user3.Name}).Group("id").Count(&count3).Error; err != nil {
+		t.Errorf("Not error should happen, but got %v", err)
+	}
+
+	if count3 != 2 {
+		t.Errorf("Should get correct count, but got %v", count3)
+	}
 }
 
 func TestNot(t *testing.T) {
@@ -462,28 +618,28 @@ func TestNot(t *testing.T) {
 	DB.Table("users").Where("name = ?", "user3").Count(&name3Count)
 	DB.Not("name", "user3").Find(&users4)
 	if len(users1)-len(users4) != int(name3Count) {
-		t.Errorf("Should find all users's name not equal 3")
+		t.Errorf("Should find all users' name not equal 3")
 	}
 
 	DB.Not("name = ?", "user3").Find(&users4)
 	if len(users1)-len(users4) != int(name3Count) {
-		t.Errorf("Should find all users's name not equal 3")
+		t.Errorf("Should find all users' name not equal 3")
 	}
 
 	DB.Not("name <> ?", "user3").Find(&users4)
 	if len(users4) != int(name3Count) {
-		t.Errorf("Should find all users's name not equal 3")
+		t.Errorf("Should find all users' name not equal 3")
 	}
 
 	DB.Not(User{Name: "user3"}).Find(&users5)
 
 	if len(users1)-len(users5) != int(name3Count) {
-		t.Errorf("Should find all users's name not equal 3")
+		t.Errorf("Should find all users' name not equal 3")
 	}
 
 	DB.Not(map[string]interface{}{"name": "user3"}).Find(&users6)
 	if len(users1)-len(users6) != int(name3Count) {
-		t.Errorf("Should find all users's name not equal 3")
+		t.Errorf("Should find all users' name not equal 3")
 	}
 
 	DB.Not(map[string]interface{}{"name": "user3", "company_id": nil}).Find(&users7)
@@ -493,14 +649,14 @@ func TestNot(t *testing.T) {
 
 	DB.Not("name", []string{"user3"}).Find(&users8)
 	if len(users1)-len(users8) != int(name3Count) {
-		t.Errorf("Should find all users's name not equal 3")
+		t.Errorf("Should find all users' name not equal 3")
 	}
 
 	var name2Count int64
 	DB.Table("users").Where("name = ?", "user2").Count(&name2Count)
 	DB.Not("name", []string{"user3", "user2"}).Find(&users9)
 	if len(users1)-len(users9) != (int(name3Count) + int(name2Count)) {
-		t.Errorf("Should find all users's name not equal 3")
+		t.Errorf("Should find all users' name not equal 3")
 	}
 }
 
@@ -663,5 +819,41 @@ func TestSelectWithArrayInput(t *testing.T) {
 
 	if user.Name != "jinzhu" || user.Age != 42 {
 		t.Errorf("Should have selected both age and name")
+	}
+}
+
+func TestPluckWithSelect(t *testing.T) {
+	var (
+		user              = User{Name: "matematik7_pluck_with_select", Age: 25}
+		combinedName      = fmt.Sprintf("%v%v", user.Name, user.Age)
+		combineUserAgeSQL = fmt.Sprintf("concat(%v, %v)", DB.Dialect().Quote("name"), DB.Dialect().Quote("age"))
+	)
+
+	if dialect := DB.Dialect().GetName(); dialect == "sqlite3" {
+		combineUserAgeSQL = fmt.Sprintf("(%v || %v)", DB.Dialect().Quote("name"), DB.Dialect().Quote("age"))
+	}
+
+	DB.Save(&user)
+
+	selectStr := combineUserAgeSQL + " as user_age"
+	var userAges []string
+	err := DB.Model(&User{}).Where("age = ?", 25).Select(selectStr).Pluck("user_age", &userAges).Error
+	if err != nil {
+		t.Error(err)
+	}
+
+	if len(userAges) != 1 || userAges[0] != combinedName {
+		t.Errorf("Should correctly pluck with select, got: %s", userAges)
+	}
+
+	selectStr = combineUserAgeSQL + fmt.Sprintf(" as %v", DB.Dialect().Quote("user_age"))
+	userAges = userAges[:0]
+	err = DB.Model(&User{}).Where("age = ?", 25).Select(selectStr).Pluck("user_age", &userAges).Error
+	if err != nil {
+		t.Error(err)
+	}
+
+	if len(userAges) != 1 || userAges[0] != combinedName {
+		t.Errorf("Should correctly pluck with select, got: %s", userAges)
 	}
 }

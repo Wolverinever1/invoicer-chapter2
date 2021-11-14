@@ -32,6 +32,16 @@ jobs:
       command: |
           go test \
           github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}
+          
+   - run:
+      name: Test dependencies are up to date
+      command: |
+        GOPATH="${GOPATH_HEAD}";
+        (
+        cd ${GOPATH_BASE}/${CIRCLE_PROJECT_REPONAME} && \
+        govend -u && \
+        git diff -quiet
+        )
 
    - deploy:
        command: |

@@ -3,28 +3,20 @@
 package mssql
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"testing"
 	"time"
 )
 
 func TestOutputParam(t *testing.T) {
-	sqltextcreate := `
-CREATE PROCEDURE abassign
-   @aid INT,
-   @bid INT OUTPUT
-AS
-BEGIN
-   SELECT @bid = @aid
-END;
-`
-	sqltextdrop := `DROP PROCEDURE abassign;`
-	sqltextrun := `abassign`
-
 	checkConnStr(t)
-	SetLogger(testLogger{t})
+	tl := testLogger{t: t}
+	defer tl.StopLogging()
+	SetLogger(&tl)
 
 	db, err := sql.Open("sqlserver", makeConnStr(t).String())
 	if err != nil {
@@ -35,41 +27,349 @@ END;
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	db.ExecContext(ctx, sqltextdrop)
-	_, err = db.ExecContext(ctx, sqltextcreate)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var bout int64
-	_, err = db.ExecContext(ctx, sqltextrun,
-		sql.Named("aid", 5),
-		sql.Named("bid", sql.Out{Dest: &bout}),
-	)
-	defer db.ExecContext(ctx, sqltextdrop)
-	if err != nil {
-		t.Error(err)
-	}
+	t.Run("sp with rows", func(t *testing.T) {
+		sqltextcreate := `
+CREATE PROCEDURE spwithrows
+   @intparam INT = NULL OUTPUT
+AS
+BEGIN
+   -- return 2 rows
+   SELECT @intparam
+   union
+   SELECT 20
 
-	if bout != 5 {
-		t.Errorf("expected 5, got %d", bout)
-	}
+   -- set output parameter value
+   SELECT @intparam = 10
+END;
+`
+		sqltextdrop := `DROP PROCEDURE spwithrows;`
+		sqltextrun := `spwithrows`
+
+		db.ExecContext(ctx, sqltextdrop)
+		_, err = db.ExecContext(ctx, sqltextcreate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.ExecContext(ctx, sqltextdrop)
+		if err != nil {
+			t.Error(err)
+		}
+
+		var intparam int = 5
+		rows, err := db.QueryContext(ctx, sqltextrun,
+			sql.Named("intparam", sql.Out{Dest: &intparam}),
+		)
+		if err != nil {
+			t.Error(err)
+		}
+		defer rows.Close()
+		// reading first row
+		if !rows.Next() {
+			t.Error("Next returned false")
+		}
+		var rowval int
+		err = rows.Scan(&rowval)
+		if err != nil {
+			t.Error(err)
+		}
+		if rowval != 5 {
+			t.Errorf("expected 5, got %d", rowval)
+		}
+
+		// if uncommented would trigger race condition warning
+		//if intparam != 10 {
+		//	t.Log("output parameter value is not yet 10, it is ", intparam)
+		//}
+
+		// reading second row
+		if !rows.Next() {
+			t.Error("Next returned false")
+		}
+		err = rows.Scan(&rowval)
+		if err != nil {
+			t.Error(err)
+		}
+		if rowval != 20 {
+			t.Errorf("expected 20, got %d", rowval)
+		}
+
+		if rows.Next() {
+			t.Error("Next returned true but should return false after last row was returned")
+		}
+
+		if intparam != 10 {
+			t.Errorf("expected 10, got %d", intparam)
+		}
+	})
+
+	t.Run("sp with no rows", func(t *testing.T) {
+		sqltextcreate := `
+CREATE PROCEDURE abassign
+   @aid INT = 5,
+   @bid INT = NULL OUTPUT,
+   @cstr NVARCHAR(2000) = NULL OUTPUT,
+   @datetime datetime = NULL OUTPUT
+AS
+BEGIN
+   SELECT @bid = @aid, @cstr = 'OK', @datetime = '2010-01-01T00:00:00';
+END;
+`
+		sqltextdrop := `DROP PROCEDURE abassign;`
+		sqltextrun := `abassign`
+
+		db.ExecContext(ctx, sqltextdrop)
+		_, err = db.ExecContext(ctx, sqltextcreate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.ExecContext(ctx, sqltextdrop)
+		if err != nil {
+			t.Error(err)
+		}
+
+		t.Run("should work", func(t *testing.T) {
+			var bout int64
+			var cout string
+			_, err = db.ExecContext(ctx, sqltextrun,
+				sql.Named("aid", 5),
+				sql.Named("bid", sql.Out{Dest: &bout}),
+				sql.Named("cstr", sql.Out{Dest: &cout}),
+			)
+			if err != nil {
+				t.Error(err)
+			}
+
+			if bout != 5 {
+				t.Errorf("expected 5, got %d", bout)
+			}
+
+			if cout != "OK" {
+				t.Errorf("expected OK, got %s", cout)
+			}
+		})
+
+		t.Run("should work if aid is not passed", func(t *testing.T) {
+			var bout int64
+			var cout string
+			_, err = db.ExecContext(ctx, sqltextrun,
+				sql.Named("bid", sql.Out{Dest: &bout}),
+				sql.Named("cstr", sql.Out{Dest: &cout}),
+			)
+			if err != nil {
+				t.Error(err)
+			}
+
+			if bout != 5 {
+				t.Errorf("expected 5, got %d", bout)
+			}
+
+			if cout != "OK" {
+				t.Errorf("expected OK, got %s", cout)
+			}
+		})
+
+		t.Run("should work for DateTime1 parameter", func(t *testing.T) {
+			tin, err := time.Parse(time.RFC3339, "2006-01-02T22:04:05-07:00")
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected, err := time.Parse(time.RFC3339, "2010-01-01T00:00:00-00:00")
+			if err != nil {
+				t.Fatal(err)
+			}
+			datetime_param := DateTime1(tin)
+			_, err = db.ExecContext(ctx, sqltextrun,
+				sql.Named("datetime", sql.Out{Dest: &datetime_param}),
+			)
+			if err != nil {
+				t.Error(err)
+			}
+			if time.Time(datetime_param).UTC() != expected.UTC() {
+				t.Errorf("Datetime returned '%v' does not match expected value '%v'",
+					time.Time(datetime_param).UTC(), expected.UTC())
+			}
+		})
+
+		t.Run("destination is not a pointer", func(t *testing.T) {
+			var int_out int64
+			var str_out string
+			// test when destination is not a pointer
+			_, actual := db.ExecContext(ctx, sqltextrun,
+				sql.Named("bid", sql.Out{Dest: int_out}),
+				sql.Named("cstr", sql.Out{Dest: &str_out}),
+			)
+			pattern := ".*destination not a pointer.*"
+			match, err := regexp.MatchString(pattern, actual.Error())
+			if err != nil {
+				t.Error(err)
+			}
+			if !match {
+				t.Errorf("Error  '%v', does not match pattern '%v'.", actual, pattern)
+			}
+		})
+
+		t.Run("should convert int64 to int", func(t *testing.T) {
+			var bout int
+			var cout string
+			_, err := db.ExecContext(ctx, sqltextrun,
+				sql.Named("bid", sql.Out{Dest: &bout}),
+				sql.Named("cstr", sql.Out{Dest: &cout}),
+			)
+			if err != nil {
+				t.Error(err)
+			}
+
+			if bout != 5 {
+				t.Errorf("expected 5, got %d", bout)
+			}
+		})
+
+		t.Run("should fail if destination has invalid type", func(t *testing.T) {
+			// Error type should not be supported
+			var err_out Error
+			_, err := db.ExecContext(ctx, sqltextrun,
+				sql.Named("bid", sql.Out{Dest: &err_out}),
+			)
+			if err == nil {
+				t.Error("Expected to fail but it didn't")
+			}
+
+			// double inderection should not work
+			var out_out = sql.Out{Dest: &err_out}
+			_, err = db.ExecContext(ctx, sqltextrun,
+				sql.Named("bid", sql.Out{Dest: out_out}),
+			)
+			if err == nil {
+				t.Error("Expected to fail but it didn't")
+			}
+		})
+
+		t.Run("should fail if parameter has invalid type", func(t *testing.T) {
+			// passing invalid parameter type
+			var err_val Error
+			_, err = db.ExecContext(ctx, sqltextrun, err_val)
+			if err == nil {
+				t.Error("Expected to fail but it didn't")
+			}
+		})
+
+		t.Run("destination is a nil pointer", func(t *testing.T) {
+			var str_out string
+			// test when destination is nil pointer
+			_, actual := db.ExecContext(ctx, sqltextrun,
+				sql.Named("bid", sql.Out{Dest: nil}),
+				sql.Named("cstr", sql.Out{Dest: &str_out}),
+			)
+			pattern := ".*destination is a nil pointer.*"
+			match, err := regexp.MatchString(pattern, actual.Error())
+			if err != nil {
+				t.Error(err)
+			}
+			if !match {
+				t.Errorf("Error  '%v', does not match pattern '%v'.", actual, pattern)
+			}
+		})
+
+		t.Run("destination is a nil pointer 2", func(t *testing.T) {
+			var int_ptr *int
+			_, actual := db.ExecContext(ctx, sqltextrun,
+				sql.Named("bid", sql.Out{Dest: int_ptr}),
+			)
+			pattern := ".*destination is a nil pointer.*"
+			match, err := regexp.MatchString(pattern, actual.Error())
+			if err != nil {
+				t.Error(err)
+			}
+			if !match {
+				t.Errorf("Error  '%v', does not match pattern '%v'.", actual, pattern)
+			}
+		})
+
+		t.Run("pointer to a pointer", func(t *testing.T) {
+			var str_out *string
+			_, actual := db.ExecContext(ctx, sqltextrun,
+				sql.Named("cstr", sql.Out{Dest: &str_out}),
+			)
+			pattern := ".*destination is a pointer to a pointer.*"
+			match, err := regexp.MatchString(pattern, actual.Error())
+			if err != nil {
+				t.Error(err)
+			}
+			if !match {
+				t.Errorf("Error  '%v', does not match pattern '%v'.", actual, pattern)
+			}
+		})
+
+		t.Run("query with rows", func(t *testing.T) {
+			sqltext := `
+SELECT @param1 = 'Hello'
+;
+SELECT 'Hi'
+;
+SELECT @param2 = 'World'
+`
+			var param1, param2 string
+			rows, err := db.QueryContext(ctx, sqltext, sql.Named("param1", sql.Out{Dest: &param1}), sql.Named("param2", sql.Out{Dest: &param2}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+
+			if !rows.Next() {
+				t.Error("Next returned false")
+			}
+			var rowval string
+			err = rows.Scan(&rowval)
+			if err != nil {
+				t.Error(err)
+			}
+			if rowval != "Hi" {
+				t.Errorf(`expected "Hi", got %#v`, rowval)
+			}
+			if rows.Next() {
+				t.Error("Next returned true but should return false after last row was returned")
+			}
+
+			// Output parameters should be filled when the resultset has been thoroughly read
+			if param1 != "Hello" {
+				t.Errorf(`@param1: expected "Hello", got %#v`, param1)
+			}
+
+			if param2 != "World" {
+				t.Errorf(`@param2: expected "World", got %#v`, param2)
+			}
+		})
+	})
 }
 
 func TestOutputINOUTParam(t *testing.T) {
 	sqltextcreate := `
 CREATE PROCEDURE abinout
-   @aid INT,
-   @bid INT OUTPUT
+   @aid INT = 1,
+   @bid INT = 2 OUTPUT,
+   @cstr NVARCHAR(2000) = NULL OUTPUT,
+   @vout VARCHAR(2000) = NULL OUTPUT,
+   @nullint INT = NULL OUTPUT,
+   @nullfloat FLOAT = NULL OUTPUT,
+   @nullstr NVARCHAR(10) = NULL OUTPUT,
+   @nullbit BIT = NULL OUTPUT,
+   @varbin VARBINARY(10) = NULL OUTPUT
 AS
 BEGIN
-   SELECT @bid = @aid + @bid;
+   SELECT
+		@bid = @aid + @bid,
+		@cstr = 'OK',
+		@vout = 'DREAM'
+	;
 END;
 `
 	sqltextdrop := `DROP PROCEDURE abinout;`
 	sqltextrun := `abinout`
 
 	checkConnStr(t)
-	SetLogger(testLogger{t})
+	tl := testLogger{t: t}
+	defer tl.StopLogging()
+	SetLogger(&tl)
 
 	db, err := sql.Open("sqlserver", makeConnStr(t).String())
 	if err != nil {
@@ -85,19 +385,335 @@ END;
 	if err != nil {
 		t.Fatal(err)
 	}
-	var bout int64 = 3
-	_, err = db.ExecContext(ctx, sqltextrun,
-		sql.Named("aid", 5),
-		sql.Named("bid", sql.Out{Dest: &bout}),
-	)
 	defer db.ExecContext(ctx, sqltextdrop)
+
+	t.Run("original test", func(t *testing.T) {
+		var bout int64 = 3
+		var cout string
+		var vout VarChar
+		_, err = db.ExecContext(ctx, sqltextrun,
+			sql.Named("aid", 5),
+			sql.Named("bid", sql.Out{Dest: &bout}),
+			sql.Named("cstr", sql.Out{Dest: &cout}),
+			sql.Named("vout", sql.Out{Dest: &vout}),
+		)
+		if err != nil {
+			t.Error(err)
+		}
+
+		if bout != 8 {
+			t.Errorf("expected 8, got %d", bout)
+		}
+
+		if cout != "OK" {
+			t.Errorf("expected OK, got %s", cout)
+		}
+		if string(vout) != "DREAM" {
+			t.Errorf("expected DREAM, got %s", vout)
+		}
+	})
+
+	t.Run("test null values returned into nullable", func(t *testing.T) {
+		var nullint sql.NullInt64
+		var nullfloat sql.NullFloat64
+		var nullstr sql.NullString
+		var nullbit sql.NullBool
+		_, err = db.ExecContext(ctx, sqltextrun,
+			sql.Named("nullint", sql.Out{Dest: &nullint}),
+			sql.Named("nullfloat", sql.Out{Dest: &nullfloat}),
+			sql.Named("nullstr", sql.Out{Dest: &nullstr}),
+			sql.Named("nullbit", sql.Out{Dest: &nullbit}),
+		)
+		if err != nil {
+			t.Error(err)
+		}
+
+		if nullint.Valid {
+			t.Errorf("expected NULL, got %v", nullint)
+		}
+		if nullfloat.Valid {
+			t.Errorf("expected NULL, got %v", nullfloat)
+		}
+		if nullstr.Valid {
+			t.Errorf("expected NULL, got %v", nullstr)
+		}
+		if nullbit.Valid {
+			t.Errorf("expected NULL, got %v", nullbit)
+		}
+	})
+
+	// Not yet supported
+	//t.Run("test null values returned into pointers", func(t *testing.T) {
+	//	var nullint *int64
+	//	var nullfloat *float64
+	//	var nullstr *string
+	//	var nullbit *bool
+	//	_, err = db.ExecContext(ctx, sqltextrun,
+	//		sql.Named("nullint", sql.Out{Dest: &nullint}),
+	//		sql.Named("nullfloat", sql.Out{Dest: &nullfloat}),
+	//		sql.Named("nullstr", sql.Out{Dest: &nullstr}),
+	//		sql.Named("nullbit", sql.Out{Dest: &nullbit}),
+	//	)
+	//	if err != nil {
+	//		t.Error(err)
+	//	}
+
+	//	if nullint != nil {
+	//		t.Errorf("expected NULL, got %v", nullint)
+	//	}
+	//	if nullfloat != nil {
+	//		t.Errorf("expected NULL, got %v", nullfloat)
+	//	}
+	//	if nullstr != nil {
+	//		t.Errorf("expected NULL, got %v", nullstr)
+	//	}
+	//	if nullbit != nil {
+	//		t.Errorf("expected NULL, got %v", nullbit)
+	//	}
+	//})
+
+	t.Run("test non null values into nullable", func(t *testing.T) {
+		nullint := sql.NullInt64{Int64: 10, Valid: true}
+		nullfloat := sql.NullFloat64{Float64: 1.5, Valid: true}
+		nullstr := sql.NullString{String: "hello", Valid: true}
+		nullbit := sql.NullBool{Bool: true, Valid: true}
+		_, err = db.ExecContext(ctx, sqltextrun,
+			sql.Named("nullint", sql.Out{Dest: &nullint}),
+			sql.Named("nullfloat", sql.Out{Dest: &nullfloat}),
+			sql.Named("nullstr", sql.Out{Dest: &nullstr}),
+			sql.Named("nullbit", sql.Out{Dest: &nullbit}),
+		)
+		if err != nil {
+			t.Error(err)
+		}
+		if !nullint.Valid {
+			t.Error("expected non null value, but got null")
+		}
+		if nullint.Int64 != 10 {
+			t.Errorf("expected 10, got %d", nullint.Int64)
+		}
+		if !nullfloat.Valid {
+			t.Error("expected non null value, but got null")
+		}
+		if nullfloat.Float64 != 1.5 {
+			t.Errorf("expected 1.5, got %v", nullfloat.Float64)
+		}
+		if !nullstr.Valid {
+			t.Error("expected non null value, but got null")
+		}
+		if nullstr.String != "hello" {
+			t.Errorf("expected hello, got %s", nullstr.String)
+		}
+	})
+	t.Run("test return into byte[]", func(t *testing.T) {
+		cstr := []byte{1, 2, 3}
+		_, err = db.ExecContext(ctx, sqltextrun,
+			sql.Named("varbin", sql.Out{Dest: &cstr}),
+		)
+		if err != nil {
+			t.Error(err)
+		}
+		expected := []byte{1, 2, 3}
+		if !bytes.Equal(cstr, expected) {
+			t.Errorf("expected [1,2,3], got %v", cstr)
+		}
+	})
+	t.Run("test int into string", func(t *testing.T) {
+		var str string
+		_, err = db.ExecContext(ctx, sqltextrun,
+			sql.Named("bid", sql.Out{Dest: &str}),
+		)
+		if err != nil {
+			t.Error(err)
+		}
+		if str != "1" {
+			t.Errorf("expected '1', got %v", str)
+		}
+	})
+	t.Run("typeless null for output parameter should return error", func(t *testing.T) {
+		var val interface{}
+		_, actual := db.ExecContext(ctx, sqltextrun,
+			sql.Named("bid", sql.Out{Dest: &val}),
+		)
+		if actual == nil {
+			t.Error("Expected to fail but didn't")
+		}
+		pattern := ".*MSSQL does not allow NULL value without type for OUTPUT parameters.*"
+		match, err := regexp.MatchString(pattern, actual.Error())
+		if err != nil {
+			t.Error(err)
+		}
+		if !match {
+			t.Errorf("Error  '%v', does not match pattern '%v'.", actual, pattern)
+		}
+	})
+}
+
+// TestOutputParamWithRows tests reading output parameter after retrieving rows from the result set
+// of a stored procedure. SQL Server sends output parameters after all the rows are returned.
+// Therefore, if the output parameter is read before all the rows are retrieved, the value will be
+// incorrect. Furthermore, the Data Race Detector would detect a data race because the output
+// variable is shared between the driver and the client application.
+//
+// Issue https://github.com/denisenkom/go-mssqldb/issues/378
+func TestOutputParamWithRows(t *testing.T) {
+	sqltextcreate := `
+	CREATE PROCEDURE spwithoutputandrows
+		@bitparam BIT OUTPUT
+	AS BEGIN
+		SET @bitparam = 1
+		SELECT 'Row 1'
+	END
+	`
+	sqltextdrop := `DROP PROCEDURE spwithoutputandrows;`
+	sqltextrun := `spwithoutputandrows`
+
+	checkConnStr(t)
+	tl := testLogger{t: t}
+	defer tl.StopLogging()
+	SetLogger(&tl)
+
+	db, err := sql.Open("sqlserver", makeConnStr(t).String())
 	if err != nil {
-		t.Error(err)
+		t.Fatalf("failed to open driver sqlserver")
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	db.ExecContext(ctx, sqltextdrop)
+	_, err = db.ExecContext(ctx, sqltextcreate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.ExecContext(ctx, sqltextdrop)
+
+	t.Run("Retrieve output after reading rows", func(t *testing.T) {
+		var bitout int64 = 5
+		rows, err := db.QueryContext(ctx, sqltextrun, sql.Named("bitparam", sql.Out{Dest: &bitout}))
+		if err != nil {
+			t.Error(err)
+		} else {
+			defer rows.Close()
+			// If the output parameter is read all the rows are retrieved:
+			// 1. The output parameter remains that same (int this case, bitout = 5)
+			// 2. Data Race Detector reports a Data Race because bitout is being shared by the driver and the client application
+			/*
+				if bitout != 5 {
+					t.Errorf("expected bitout to remain as 5, got %d", bitout)
+				}
+			*/
+			var strrow string
+			for rows.Next() {
+				err = rows.Scan(&strrow)
+				if err != nil {
+					t.Fatal("scan failed", err)
+				}
+			}
+			if bitout != 1 {
+				t.Errorf("expected 1, got %d", bitout)
+			}
+		}
+	})
+}
+
+func TestParamNoName(t *testing.T) {
+	checkConnStr(t)
+	tl := testLogger{t: t}
+	defer tl.StopLogging()
+	SetLogger(&tl)
+
+	db, err := sql.Open("sqlserver", makeConnStr(t).String())
+	if err != nil {
+		t.Fatalf("failed to open driver sqlserver")
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	checkResults := func(r *sql.Rows, tInner *testing.T) {
+		var intCol int
+		var nvarcharCol string
+		var varcharCol string
+		for r.Next() {
+			err = r.Scan(&intCol, &nvarcharCol, &varcharCol)
+		}
+		if intCol != 5 {
+			tInner.Errorf("expected 5, got %d", intCol)
+		}
+		if nvarcharCol != "OK" {
+			tInner.Errorf("expected OK, got %s", nvarcharCol)
+		}
+		if varcharCol != "DREAM" {
+			tInner.Errorf("expected DREAM, got %s", varcharCol)
+		}
 	}
 
-	if bout != 8 {
-		t.Errorf("expected 8, got %d", bout)
-	}
+	t.Run("Execute stored prodecure", func(t *testing.T) {
+		sqltextcreate := `
+		CREATE PROCEDURE spnoparamname
+			@intCol INT,
+			@nvarcharCol NVARCHAR(2000),
+			@varcharCol VARCHAR(2000)
+		AS BEGIN
+			SELECT @intCol, @nvarcharCol, @varcharCol
+		END`
+		sqltextdrop := `DROP PROCEDURE spnoparamname`
+		sqltextrun := `spnoparamname`
+
+		db.ExecContext(ctx, sqltextdrop)
+		_, err = db.ExecContext(ctx, sqltextcreate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.ExecContext(ctx, sqltextdrop)
+
+		t.Run("With no parameter names", func(t *testing.T) {
+			rows, err := db.QueryContext(ctx, sqltextrun, 5, "OK", "DREAM")
+			if err != nil {
+				t.Error(err)
+			} else {
+				defer rows.Close()
+				checkResults(rows, t)
+			}
+		})
+
+		t.Run("With parameter names", func(t *testing.T) {
+			rows, err := db.QueryContext(ctx, sqltextrun, sql.Named("intCol", 5), sql.Named("nvarcharCol", "OK"), sql.Named("varcharCol", "DREAM"))
+			if err != nil {
+				t.Error(err)
+			} else {
+				defer rows.Close()
+				checkResults(rows, t)
+			}
+		})
+	})
+
+	t.Run("Execute query", func(t *testing.T) {
+		sqltextrun := "SELECT @p1, @p2, @p3"
+
+		t.Run("With no parameter names", func(t *testing.T) {
+			rows, err := db.QueryContext(ctx, sqltextrun, 5, "OK", "DREAM")
+			if err != nil {
+				t.Error(err)
+			} else {
+				defer rows.Close()
+				checkResults(rows, t)
+			}
+		})
+
+		t.Run("With parameter names", func(t *testing.T) {
+			rows, err := db.QueryContext(ctx, sqltextrun, sql.Named("p1", 5), sql.Named("p2", "OK"), sql.Named("p3", "DREAM"))
+			if err != nil {
+				t.Error(err)
+			} else {
+				defer rows.Close()
+				checkResults(rows, t)
+			}
+		})
+	})
 }
 
 // TestTLSServerReadClose tests writing to an encrypted database connection.
@@ -329,9 +945,11 @@ with
                     ) X(a))
     select * from config_cte
 	`
+	t.Logf("query len (utf16 bytes)=%d, len/4096=%f\n", len(query)*2, float64(len(query)*2)/4096)
 
-	db := open(t)
+	db, logger := open(t)
 	defer db.Close()
+	defer logger.StopLogging()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -347,7 +965,7 @@ with
 	// Use separate Conns from the connection pool to ensure separation.
 	runs := []*run{
 		{name: "rev", pings: []int{4, 1}, pass: true},
-		{name: "forward", pings: []int{1}, pass: false},
+		{name: "forward", pings: []int{1}, pass: true},
 	}
 	for _, r := range runs {
 		var err error
@@ -375,17 +993,115 @@ with
 				rows, err := r.conn.QueryContext(ctx, query)
 				if err != nil {
 					if r.pass {
-						t.Error("QueryContext", len(query), err)
+						t.Errorf("QueryContext: %+v", err)
 					} else {
-						t.Log("QueryContext", len(query), err)
+						t.Logf("QueryContext: %+v", err)
 					}
 					return
 				}
+				defer rows.Close()
 				for rows.Next() {
 					// Nothing.
 				}
-				rows.Close()
 			})
 		}
+	}
+}
+
+func TestDateTimeParam19(t *testing.T) {
+	conn, logger := open(t)
+	defer conn.Close()
+	logger.StopLogging()
+
+	// testing DateTime1, only supported on go 1.9
+	var emptydate time.Time
+	mindate1 := time.Date(1753, 1, 1, 0, 0, 0, 0, time.UTC)
+	maxdate1 := time.Date(9999, 12, 31, 23, 59, 59, 997000000, time.UTC)
+	testdates1 := []DateTime1{
+		DateTime1(mindate1),
+		DateTime1(maxdate1),
+		DateTime1(time.Date(1752, 12, 31, 23, 59, 59, 997000000, time.UTC)), // just a little below minimum date
+		DateTime1(time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)),             // just a little over maximum date
+		DateTime1(emptydate),
+	}
+
+	for _, test := range testdates1 {
+		t.Run(fmt.Sprintf("Test datetime for %v", test), func(t *testing.T) {
+			var res time.Time
+			expected := time.Time(test)
+			queryParamRoundTrip(conn, test, &res)
+			// clip value
+			if expected.Before(mindate1) {
+				expected = mindate1
+			}
+			if expected.After(maxdate1) {
+				expected = maxdate1
+			}
+			if expected.Sub(res) != 0 {
+				t.Errorf("expected: '%s', got: '%s' delta: %d", expected, res, expected.Sub(res))
+			}
+		})
+	}
+}
+
+func TestReturnStatus(t *testing.T) {
+	conn, logger := open(t)
+	defer conn.Close()
+	defer logger.StopLogging()
+
+	_, err := conn.Exec("if object_id('retstatus') is not null drop proc retstatus;")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = conn.Exec("create proc retstatus as return 2;")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var rs ReturnStatus
+	_, err = conn.Exec("retstatus", &rs)
+	conn.Exec("drop proc retstatus;")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rs != 2 {
+		t.Errorf("expected status=2, got %d", rs)
+	}
+}
+
+func TestClearReturnStatus(t *testing.T) {
+	db, logger := open(t)
+	defer db.Close()
+	defer logger.StopLogging()
+
+	ctx := context.TODO()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = conn.ExecContext(ctx, "CREATE PROC #get_answer AS RETURN 42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = conn.ExecContext(ctx, "CREATE PROC #get_half AS RETURN 21")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var rs ReturnStatus
+
+	_, err = conn.ExecContext(ctx, "#get_answer", &rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = conn.ExecContext(ctx, "#get_half")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if rs != 42 {
+		t.Errorf("expected status=42, got %d", rs)
 	}
 }

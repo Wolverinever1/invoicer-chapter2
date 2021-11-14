@@ -20,10 +20,6 @@ func NewRecorder() *httptest.ResponseRecorder {
 	}
 }
 
-// DefaultRemoteAddr is the default remote address to return in RemoteAddr if
-// an explicit DefaultRemoteAddr isn't set on ResponseRecorder.
-const DefaultRemoteAddr = "1.2.3.4"
-
 // ----------------------------------------------------------------------------
 
 type FlashMessage struct {
@@ -152,6 +148,62 @@ func TestFlashes(t *testing.T) {
 	custom := flashes[0].(FlashMessage)
 	if custom.Type != 42 || custom.Message != "foo" {
 		t.Errorf("Expected %#v, got %#v", FlashMessage{42, "foo"}, custom)
+	}
+
+	// Round 5 ----------------------------------------------------------------
+	// Check if a request shallow copy resets the request context data store.
+
+	req, _ = http.NewRequest("GET", "http://localhost:8080/", nil)
+
+	// Get a session.
+	if session, err = store.Get(req, "session-key"); err != nil {
+		t.Fatalf("Error getting session: %v", err)
+	}
+
+	// Put a test value into the session data store.
+	session.Values["test"] = "test-value"
+
+	// Create a shallow copy of the request.
+	req = req.WithContext(req.Context())
+
+	// Get the session again.
+	if session, err = store.Get(req, "session-key"); err != nil {
+		t.Fatalf("Error getting session: %v", err)
+	}
+
+	// Check if the previous inserted value still exists.
+	if session.Values["test"] == nil {
+		t.Fatalf("Session test value is lost in the request context!")
+	}
+
+	// Check if the previous inserted value has the same value.
+	if session.Values["test"] != "test-value" {
+		t.Fatalf("Session test value is changed in the request context!")
+	}
+}
+
+func TestCookieStoreMapPanic(t *testing.T) {
+	defer func() {
+		err := recover()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	store := NewCookieStore([]byte("aaa0defe5d2839cbc46fc4f080cd7adc"))
+	req, err := http.NewRequest("GET", "http://www.example.com", nil)
+	if err != nil {
+		t.Fatal("failed to create request", err)
+	}
+	w := httptest.NewRecorder()
+
+	session := NewSession(store, "hello")
+
+	session.Values["data"] = "hello-world"
+
+	err = session.Save(req, w)
+	if err != nil {
+		t.Fatal("failed to save session", err)
 	}
 }
 
