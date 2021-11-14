@@ -10,6 +10,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -115,6 +116,10 @@ func (iv *invoicer) getInvoice(w http.ResponseWriter, r *http.Request) {
 	if i1.ID == 0 {
 		httpError(w, r, http.StatusNotFound, "No invoice id %s", vars["id"])
 		return
+	}
+	for i := 0; i < len(i1.Charges); i++ {
+		i1.Charges[i].Type = html.EscapeString(i1.Charges[i].Type)
+		i1.Charges[i].Description = html.EscapeString(i1.Charges[i].Description)
 	}
 	iv.db.Where("invoice_id = ?", i1.ID).Find(&i1.Charges)
 	jsonInvoice, err := json.Marshal(i1)
