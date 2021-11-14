@@ -1,12 +1,16 @@
 package mssql
 
 import (
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
+	// Importing mssql driver package only in dialect file, otherwide not needed
 	_ "github.com/denisenkom/go-mssqldb"
 	"github.com/jinzhu/gorm"
 )
@@ -14,7 +18,7 @@ import (
 func setIdentityInsert(scope *gorm.Scope) {
 	if scope.Dialect().GetName() == "mssql" {
 		for _, field := range scope.PrimaryFields() {
-			if _, ok := field.TagSettings["AUTO_INCREMENT"]; ok && !field.IsBlank {
+			if _, ok := field.TagSettingsGet("AUTO_INCREMENT"); ok && !field.IsBlank {
 				scope.NewDB().Exec(fmt.Sprintf("SET IDENTITY_INSERT %v ON", scope.TableName()))
 				scope.InstanceSet("mssql:identity_insert_on", true)
 			}
@@ -54,7 +58,7 @@ func (mssql) BindVar(i int) string {
 }
 
 func (mssql) Quote(key string) string {
-	return fmt.Sprintf(`"%s"`, key)
+	return fmt.Sprintf(`[%s]`, key)
 }
 
 func (s *mssql) DataTypeOf(field *gorm.StructField) string {
@@ -65,15 +69,15 @@ func (s *mssql) DataTypeOf(field *gorm.StructField) string {
 		case reflect.Bool:
 			sqlType = "bit"
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uintptr:
-			if _, ok := field.TagSettings["AUTO_INCREMENT"]; ok || field.IsPrimaryKey {
-				field.TagSettings["AUTO_INCREMENT"] = "AUTO_INCREMENT"
+			if s.fieldCanAutoIncrement(field) {
+				field.TagSettingsSet("AUTO_INCREMENT", "AUTO_INCREMENT")
 				sqlType = "int IDENTITY(1,1)"
 			} else {
 				sqlType = "int"
 			}
 		case reflect.Int64, reflect.Uint64:
-			if _, ok := field.TagSettings["AUTO_INCREMENT"]; ok || field.IsPrimaryKey {
-				field.TagSettings["AUTO_INCREMENT"] = "AUTO_INCREMENT"
+			if s.fieldCanAutoIncrement(field) {
+				field.TagSettingsSet("AUTO_INCREMENT", "AUTO_INCREMENT")
 				sqlType = "bigint IDENTITY(1,1)"
 			} else {
 				sqlType = "bigint"
@@ -111,6 +115,13 @@ func (s *mssql) DataTypeOf(field *gorm.StructField) string {
 	return fmt.Sprintf("%v %v", sqlType, additionalType)
 }
 
+func (s mssql) fieldCanAutoIncrement(field *gorm.StructField) bool {
+	if value, ok := field.TagSettingsGet("AUTO_INCREMENT"); ok {
+		return value != "FALSE"
+	}
+	return field.IsPrimaryKey
+}
+
 func (s mssql) HasIndex(tableName string, indexName string) bool {
 	var count int
 	s.db.QueryRow("SELECT count(*) FROM sys.indexes WHERE name=? AND object_id=OBJECT_ID(?)", indexName, tableName).Scan(&count)
@@ -123,19 +134,33 @@ func (s mssql) RemoveIndex(tableName string, indexName string) error {
 }
 
 func (s mssql) HasForeignKey(tableName string, foreignKeyName string) bool {
-	return false
+	var count int
+	currentDatabase, tableName := currentDatabaseAndTable(&s, tableName)
+	s.db.QueryRow(`SELECT count(*) 
+	FROM sys.foreign_keys as F inner join sys.tables as T on F.parent_object_id=T.object_id 
+		inner join information_schema.tables as I on I.TABLE_NAME = T.name 
+	WHERE F.name = ? 
+		AND T.Name = ? AND I.TABLE_CATALOG = ?;`, foreignKeyName, tableName, currentDatabase).Scan(&count)
+	return count > 0
 }
 
 func (s mssql) HasTable(tableName string) bool {
 	var count int
-	s.db.QueryRow("SELECT count(*) FROM INFORMATION_SCHEMA.tables WHERE table_name = ? AND table_catalog = ?", tableName, s.CurrentDatabase()).Scan(&count)
+	currentDatabase, tableName := currentDatabaseAndTable(&s, tableName)
+	s.db.QueryRow("SELECT count(*) FROM INFORMATION_SCHEMA.tables WHERE table_name = ? AND table_catalog = ?", tableName, currentDatabase).Scan(&count)
 	return count > 0
 }
 
 func (s mssql) HasColumn(tableName string, columnName string) bool {
 	var count int
-	s.db.QueryRow("SELECT count(*) FROM information_schema.columns WHERE table_catalog = ? AND table_name = ? AND column_name = ?", s.CurrentDatabase(), tableName, columnName).Scan(&count)
+	currentDatabase, tableName := currentDatabaseAndTable(&s, tableName)
+	s.db.QueryRow("SELECT count(*) FROM information_schema.columns WHERE table_catalog = ? AND table_name = ? AND column_name = ?", currentDatabase, tableName, columnName).Scan(&count)
 	return count > 0
+}
+
+func (s mssql) ModifyColumn(tableName string, columnName string, typ string) error {
+	_, err := s.db.Exec(fmt.Sprintf("ALTER TABLE %v ALTER COLUMN %v %v", tableName, columnName, typ))
+	return err
 }
 
 func (s mssql) CurrentDatabase() (name string) {
@@ -143,14 +168,22 @@ func (s mssql) CurrentDatabase() (name string) {
 	return
 }
 
-func (mssql) LimitAndOffsetSQL(limit, offset interface{}) (sql string) {
+func parseInt(value interface{}) (int64, error) {
+	return strconv.ParseInt(fmt.Sprint(value), 0, 0)
+}
+
+func (mssql) LimitAndOffsetSQL(limit, offset interface{}) (sql string, err error) {
 	if offset != nil {
-		if parsedOffset, err := strconv.ParseInt(fmt.Sprint(offset), 0, 0); err == nil && parsedOffset >= 0 {
+		if parsedOffset, err := parseInt(offset); err != nil {
+			return "", err
+		} else if parsedOffset >= 0 {
 			sql += fmt.Sprintf(" OFFSET %d ROWS", parsedOffset)
 		}
 	}
 	if limit != nil {
-		if parsedLimit, err := strconv.ParseInt(fmt.Sprint(limit), 0, 0); err == nil && parsedLimit >= 0 {
+		if parsedLimit, err := parseInt(limit); err != nil {
+			return "", err
+		} else if parsedLimit >= 0 {
 			if sql == "" {
 				// add default zero offset
 				sql += " OFFSET 0 ROWS"
@@ -165,6 +198,56 @@ func (mssql) SelectFromDummyTable() string {
 	return ""
 }
 
+func (mssql) LastInsertIDOutputInterstitial(tableName, columnName string, columns []string) string {
+	if len(columns) == 0 {
+		// No OUTPUT to query
+		return ""
+	}
+	return fmt.Sprintf("OUTPUT Inserted.%v", columnName)
+}
+
 func (mssql) LastInsertIDReturningSuffix(tableName, columnName string) string {
-	return ""
+	// https://stackoverflow.com/questions/5228780/how-to-get-last-inserted-id
+	return "; SELECT SCOPE_IDENTITY()"
+}
+
+func (mssql) DefaultValueStr() string {
+	return "DEFAULT VALUES"
+}
+
+// NormalizeIndexAndColumn returns argument's index name and column name without doing anything
+func (mssql) NormalizeIndexAndColumn(indexName, columnName string) (string, string) {
+	return indexName, columnName
+}
+
+func currentDatabaseAndTable(dialect gorm.Dialect, tableName string) (string, string) {
+	if strings.Contains(tableName, ".") {
+		splitStrings := strings.SplitN(tableName, ".", 2)
+		return splitStrings[0], splitStrings[1]
+	}
+	return dialect.CurrentDatabase(), tableName
+}
+
+// JSON type to support easy handling of JSON data in character table fields
+// using golang json.RawMessage for deferred decoding/encoding
+type JSON struct {
+	json.RawMessage
+}
+
+// Value get value of JSON
+func (j JSON) Value() (driver.Value, error) {
+	if len(j.RawMessage) == 0 {
+		return nil, nil
+	}
+	return j.MarshalJSON()
+}
+
+// Scan scan value into JSON
+func (j *JSON) Scan(value interface{}) error {
+	str, ok := value.(string)
+	if !ok {
+		return errors.New(fmt.Sprint("Failed to unmarshal JSONB value (strcast):", value))
+	}
+	bytes := []byte(str)
+	return json.Unmarshal(bytes, j)
 }

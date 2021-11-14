@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
-	"strings"
+	"regexp"
 	"testing"
 	"time"
 
@@ -59,6 +59,8 @@ var timeTests = []struct {
 		time.FixedZone("", -(7*60*60+42*60)))},
 	{"2001-02-03 04:05:06-07:30:09", time.Date(2001, time.February, 3, 4, 5, 6, 0,
 		time.FixedZone("", -(7*60*60+30*60+9)))},
+	{"2001-02-03 04:05:06+07:30:09", time.Date(2001, time.February, 3, 4, 5, 6, 0,
+		time.FixedZone("", +(7*60*60+30*60+9)))},
 	{"2001-02-03 04:05:06+07", time.Date(2001, time.February, 3, 4, 5, 6, 0,
 		time.FixedZone("", 7*60*60))},
 	{"0011-02-03 04:05:06 BC", time.Date(-10, time.February, 3, 4, 5, 6, 0, time.FixedZone("", 0))},
@@ -197,6 +199,87 @@ func TestFormatTsBackend(t *testing.T) {
 	}
 }
 
+func TestTimeWithoutTimezone(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	for _, tc := range []struct {
+		refTime      string
+		expectedTime time.Time
+	}{
+		{"11:59:59", time.Date(0, 1, 1, 11, 59, 59, 0, time.UTC)},
+		{"24:00", time.Date(0, 1, 2, 0, 0, 0, 0, time.UTC)},
+		{"24:00:00", time.Date(0, 1, 2, 0, 0, 0, 0, time.UTC)},
+		{"24:00:00.0", time.Date(0, 1, 2, 0, 0, 0, 0, time.UTC)},
+		{"24:00:00.000000", time.Date(0, 1, 2, 0, 0, 0, 0, time.UTC)},
+	} {
+		t.Run(
+			fmt.Sprintf("%s => %s", tc.refTime, tc.expectedTime.Format(time.RFC3339)),
+			func(t *testing.T) {
+				var gotTime time.Time
+				row := tx.QueryRow("select $1::time", tc.refTime)
+				err = row.Scan(&gotTime)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if !tc.expectedTime.Equal(gotTime) {
+					t.Errorf("timestamps not equal: %s != %s", tc.expectedTime, gotTime)
+				}
+			},
+		)
+	}
+}
+
+func TestTimeWithTimezone(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	for _, tc := range []struct {
+		refTime      string
+		expectedTime time.Time
+	}{
+		{"11:59:59+00:00", time.Date(0, 1, 1, 11, 59, 59, 0, time.UTC)},
+		{"11:59:59+04:00", time.Date(0, 1, 1, 11, 59, 59, 0, time.FixedZone("+04", 4*60*60))},
+		{"11:59:59+04:01:02", time.Date(0, 1, 1, 11, 59, 59, 0, time.FixedZone("+04:01:02", 4*60*60+1*60+2))},
+		{"11:59:59-04:01:02", time.Date(0, 1, 1, 11, 59, 59, 0, time.FixedZone("-04:01:02", -(4*60*60+1*60+2)))},
+		{"24:00+00", time.Date(0, 1, 2, 0, 0, 0, 0, time.UTC)},
+		{"24:00Z", time.Date(0, 1, 2, 0, 0, 0, 0, time.UTC)},
+		{"24:00-04:00", time.Date(0, 1, 2, 0, 0, 0, 0, time.FixedZone("-04", -4*60*60))},
+		{"24:00:00+00", time.Date(0, 1, 2, 0, 0, 0, 0, time.UTC)},
+		{"24:00:00.0+00", time.Date(0, 1, 2, 0, 0, 0, 0, time.UTC)},
+		{"24:00:00.000000+00", time.Date(0, 1, 2, 0, 0, 0, 0, time.UTC)},
+	} {
+		t.Run(
+			fmt.Sprintf("%s => %s", tc.refTime, tc.expectedTime.Format(time.RFC3339)),
+			func(t *testing.T) {
+				var gotTime time.Time
+				row := tx.QueryRow("select $1::timetz", tc.refTime)
+				err = row.Scan(&gotTime)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if !tc.expectedTime.Equal(gotTime) {
+					t.Errorf("timestamps not equal: %s != %s", tc.expectedTime, gotTime)
+				}
+			},
+		)
+	}
+}
+
 func TestTimestampWithTimeZone(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
@@ -267,9 +350,7 @@ func TestTimestampWithOutTimezone(t *testing.T) {
 			t.Fatalf("Could not run query: %v", err)
 		}
 
-		n := r.Next()
-
-		if n != true {
+		if !r.Next() {
 			t.Fatal("Expected at least one row")
 		}
 
@@ -289,8 +370,7 @@ func TestTimestampWithOutTimezone(t *testing.T) {
 				expected, result)
 		}
 
-		n = r.Next()
-		if n != false {
+		if r.Next() {
 			t.Fatal("Expected only one row")
 		}
 	}
@@ -307,24 +387,27 @@ func TestInfinityTimestamp(t *testing.T) {
 	var err error
 	var resultT time.Time
 
-	expectedErrorStrPrefix := `sql: Scan error on column index 0: unsupported`
+	expectedErrorStrRegexp := regexp.MustCompile(
+		`^sql: Scan error on column index 0(, name "timestamp(tz)?"|): unsupported`)
+
 	type testCases []struct {
-		Query                string
-		Param                string
-		ExpectedErrStrPrefix string
-		ExpectedVal          interface{}
+		Query                  string
+		Param                  string
+		ExpectedErrorStrRegexp *regexp.Regexp
+		ExpectedVal            interface{}
 	}
 	tc := testCases{
-		{"SELECT $1::timestamp", "-infinity", expectedErrorStrPrefix, "-infinity"},
-		{"SELECT $1::timestamptz", "-infinity", expectedErrorStrPrefix, "-infinity"},
-		{"SELECT $1::timestamp", "infinity", expectedErrorStrPrefix, "infinity"},
-		{"SELECT $1::timestamptz", "infinity", expectedErrorStrPrefix, "infinity"},
+		{"SELECT $1::timestamp", "-infinity", expectedErrorStrRegexp, "-infinity"},
+		{"SELECT $1::timestamptz", "-infinity", expectedErrorStrRegexp, "-infinity"},
+		{"SELECT $1::timestamp", "infinity", expectedErrorStrRegexp, "infinity"},
+		{"SELECT $1::timestamptz", "infinity", expectedErrorStrRegexp, "infinity"},
 	}
 	// try to assert []byte to time.Time
 	for _, q := range tc {
 		err = db.QueryRow(q.Query, q.Param).Scan(&resultT)
-		if !strings.HasPrefix(err.Error(), q.ExpectedErrStrPrefix) {
-			t.Errorf("Scanning -/+infinity, expected error to have prefix %q, got %q", q.ExpectedErrStrPrefix, err)
+		if err == nil || !q.ExpectedErrorStrRegexp.MatchString(err.Error()) {
+			t.Errorf("Scanning -/+infinity, expected error to match regexp %q, got %q",
+				q.ExpectedErrorStrRegexp, err)
 		}
 	}
 	// yield []byte
@@ -731,8 +814,7 @@ func TestAppendEscapedText(t *testing.T) {
 }
 
 func TestAppendEscapedTextExistingBuffer(t *testing.T) {
-	var buf []byte
-	buf = []byte("123\t")
+	buf := []byte("123\t")
 	if esc := appendEscapedText(buf, "hallo\tescape"); string(esc) != "123\thallo\\tescape" {
 		t.Fatal(string(esc))
 	}

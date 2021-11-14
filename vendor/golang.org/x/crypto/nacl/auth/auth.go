@@ -40,14 +40,14 @@ const (
 func Sum(m []byte, key *[KeySize]byte) *[Size]byte {
 	mac := hmac.New(sha512.New, key[:])
 	mac.Write(m)
-	out := new([KeySize]byte)
+	out := new([Size]byte)
 	copy(out[:], mac.Sum(nil)[:Size])
 	return out
 }
 
 // Verify checks that digest is a valid authenticator of message m under the
 // given secret key. Verify does not leak timing information.
-func Verify(digest []byte, m []byte, key *[32]byte) bool {
+func Verify(digest []byte, m []byte, key *[KeySize]byte) bool {
 	if len(digest) != Size {
 		return false
 	}

@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/gorilla/securecookie"
@@ -47,9 +46,6 @@ type Store interface {
 // It is recommended to use an authentication key with 32 or 64 bytes.
 // The encryption key, if set, must be either 16, 24, or 32 bytes to select
 // AES-128, AES-192, or AES-256 modes.
-//
-// Use the convenience function securecookie.GenerateRandomKey() to create
-// strong keys.
 func NewCookieStore(keyPairs ...[]byte) *CookieStore {
 	cs := &CookieStore{
 		Codecs: securecookie.CodecsFromPairs(keyPairs...),
@@ -204,6 +200,8 @@ func (s *FilesystemStore) New(r *http.Request, name string) (*Session, error) {
 	return session, err
 }
 
+var base32RawStdEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
+
 // Save adds a single session to the response.
 //
 // If the Options.MaxAge of the session is <= 0 then the session file will be
@@ -224,9 +222,8 @@ func (s *FilesystemStore) Save(r *http.Request, w http.ResponseWriter,
 	if session.ID == "" {
 		// Because the ID is used in the filename, encode it to
 		// use alphanumeric characters only.
-		session.ID = strings.TrimRight(
-			base32.StdEncoding.EncodeToString(
-				securecookie.GenerateRandomKey(32)), "=")
+		session.ID = base32RawStdEncoding.EncodeToString(
+			securecookie.GenerateRandomKey(32))
 	}
 	if err := s.save(session); err != nil {
 		return err

@@ -1,7 +1,9 @@
-// Copyright (C) 2014 Yasuhiro Matsumoto <mattn.jp@gmail.com>.
+// Copyright (C) 2019 Yasuhiro Matsumoto <mattn.jp@gmail.com>.
 //
 // Use of this source code is governed by an MIT-style
 // license that can be found in the LICENSE file.
+
+// +build cgo
 
 package sqlite3
 
@@ -17,6 +19,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,7 +27,7 @@ import (
 	"time"
 )
 
-func TempFilename(t *testing.T) string {
+func TempFilename(t testing.TB) string {
 	f, err := ioutil.TempFile("", "go-sqlite3-test-")
 	if err != nil {
 		t.Fatal(err)
@@ -34,20 +37,32 @@ func TempFilename(t *testing.T) string {
 }
 
 func doTestOpen(t *testing.T, option string) (string, error) {
-	var url string
 	tempFilename := TempFilename(t)
-	defer os.Remove(tempFilename)
-	if option != "" {
-		url = tempFilename + option
-	} else {
-		url = tempFilename
-	}
+	url := tempFilename + option
+
+	defer func() {
+		err := os.Remove(tempFilename)
+		if err != nil {
+			t.Error("temp file remove error:", err)
+		}
+	}()
+
 	db, err := sql.Open("sqlite3", url)
 	if err != nil {
 		return "Failed to open database:", err
 	}
-	defer os.Remove(tempFilename)
-	defer db.Close()
+
+	defer func() {
+		err = db.Close()
+		if err != nil {
+			t.Error("db close error:", err)
+		}
+	}()
+
+	err = db.Ping()
+	if err != nil {
+		return "ping error:", err
+	}
 
 	_, err = db.Exec("drop table foo")
 	_, err = db.Exec("create table foo (id integer)")
@@ -84,6 +99,101 @@ func TestOpen(t *testing.T) {
 				t.Fatal(result, err)
 			}
 		}
+	}
+}
+
+func TestOpenWithVFS(t *testing.T) {
+	filename := t.Name() + ".sqlite"
+
+	if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	defer os.Remove(filename)
+
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?vfs=hello", filename))
+	if err != nil {
+		t.Fatal("Failed to open", err)
+	}
+	err = db.Ping()
+	if err == nil {
+		t.Fatal("Failed to open", err)
+	}
+	db.Close()
+
+	defer os.Remove(filename)
+
+	var vfs string
+	if runtime.GOOS == "windows" {
+		vfs = "win32-none"
+	} else {
+		vfs = "unix-none"
+	}
+	db, err = sql.Open("sqlite3", fmt.Sprintf("file:%s?vfs=%s", filename, vfs))
+	if err != nil {
+		t.Fatal("Failed to open", err)
+	}
+	err = db.Ping()
+	if err != nil {
+		t.Fatal("Failed to ping", err)
+	}
+	db.Close()
+}
+
+func TestOpenNoCreate(t *testing.T) {
+	filename := t.Name() + ".sqlite"
+
+	if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	defer os.Remove(filename)
+
+	// https://golang.org/pkg/database/sql/#Open
+	// "Open may just validate its arguments without creating a connection
+	// to the database. To verify that the data source name is valid, call Ping."
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?mode=rw", filename))
+	if err == nil {
+		defer db.Close()
+
+		err = db.Ping()
+		if err == nil {
+			t.Fatal("expected error from Open or Ping")
+		}
+	}
+
+	sqlErr, ok := err.(Error)
+	if !ok {
+		t.Fatalf("expected sqlite3.Error, but got %T", err)
+	}
+
+	if sqlErr.Code != ErrCantOpen {
+		t.Fatalf("expected SQLITE_CANTOPEN, but got %v", sqlErr)
+	}
+
+	// make sure database file truly was not created
+	if _, err := os.Stat(filename); !os.IsNotExist(err) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("expected database file to not exist")
+	}
+
+	// verify that it works if the mode is "rwc" instead
+	db, err = sql.Open("sqlite3", fmt.Sprintf("file:%s?mode=rwc", filename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatal(err)
+	}
+
+	// make sure database file truly was created
+	if _, err := os.Stat(filename); err != nil {
+		if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		t.Fatal("expected database file to exist")
 	}
 }
 
@@ -229,6 +339,55 @@ func TestInsert(t *testing.T) {
 	if result != 123 {
 		t.Errorf("Expected %d for fetched result, but %d:", 123, result)
 	}
+}
+
+func TestUpsert(t *testing.T) {
+	_, n, _ := Version()
+	if n < 3024000 {
+		t.Skip("UPSERT requires sqlite3 >= 3.24.0")
+	}
+	tempFilename := TempFilename(t)
+	defer os.Remove(tempFilename)
+	db, err := sql.Open("sqlite3", tempFilename)
+	if err != nil {
+		t.Fatal("Failed to open database:", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("drop table foo")
+	_, err = db.Exec("create table foo (name string primary key, counter integer)")
+	if err != nil {
+		t.Fatal("Failed to create table:", err)
+	}
+
+	for i := 0; i < 10; i++ {
+		res, err := db.Exec("insert into foo(name, counter) values('key', 1) on conflict (name) do update set counter=counter+1")
+		if err != nil {
+			t.Fatal("Failed to upsert record:", err)
+		}
+		affected, _ := res.RowsAffected()
+		if affected != 1 {
+			t.Fatalf("Expected %d for affected rows, but %d:", 1, affected)
+		}
+	}
+	rows, err := db.Query("select name, counter from foo")
+	if err != nil {
+		t.Fatal("Failed to select records:", err)
+	}
+	defer rows.Close()
+
+	rows.Next()
+
+	var resultName string
+	var resultCounter int
+	rows.Scan(&resultName, &resultCounter)
+	if resultName != "key" {
+		t.Errorf("Expected %s for fetched result, but %s:", "key", resultName)
+	}
+	if resultCounter != 10 {
+		t.Errorf("Expected %d for fetched result, but %d:", 10, resultCounter)
+	}
+
 }
 
 func TestUpdate(t *testing.T) {
@@ -563,7 +722,7 @@ func TestBoolean(t *testing.T) {
 		t.Fatalf("Expected 1 row but %v", counter)
 	}
 
-	if id != 1 && fbool != true {
+	if id != 1 && !fbool {
 		t.Fatalf("Value for id 1 should be %v, not %v", bool1, fbool)
 	}
 
@@ -585,7 +744,7 @@ func TestBoolean(t *testing.T) {
 		t.Fatalf("Expected 1 row but %v", counter)
 	}
 
-	if id != 2 && fbool != false {
+	if id != 2 && fbool {
 		t.Fatalf("Value for id 2 should be %v, not %v", bool2, fbool)
 	}
 
@@ -1209,16 +1368,16 @@ func TestFunctionRegistration(t *testing.T) {
 		{"SELECT addf32_64(1.5,1.5)", float64(3)},
 		{"SELECT not(1)", false},
 		{"SELECT not(0)", true},
-		{`SELECT regex("^foo.*", "foobar")`, true},
-		{`SELECT regex("^foo.*", "barfoobar")`, false},
+		{`SELECT regex('^foo.*', 'foobar')`, true},
+		{`SELECT regex('^foo.*', 'barfoobar')`, false},
 		{"SELECT generic(1)", int64(1)},
 		{"SELECT generic(1.1)", int64(2)},
 		{`SELECT generic(NULL)`, int64(3)},
-		{`SELECT generic("foo")`, int64(4)},
+		{`SELECT generic('foo')`, int64(4)},
 		{"SELECT variadic(1,2)", int64(3)},
 		{"SELECT variadic(1,2,3,4)", int64(10)},
 		{"SELECT variadic(1,1,1,1,1,1,1,1,1,1)", int64(10)},
-		{`SELECT variadicGeneric(1,"foo",2.3, NULL)`, int64(4)},
+		{`SELECT variadicGeneric(1,'foo',2.3, NULL)`, int64(4)},
 	}
 
 	for _, op := range ops {
@@ -1228,6 +1387,63 @@ func TestFunctionRegistration(t *testing.T) {
 			t.Errorf("Query %q failed: %s", op.query, err)
 		} else if !reflect.DeepEqual(ret.Elem().Interface(), op.expected) {
 			t.Errorf("Query %q returned wrong value: got %v (%T), want %v (%T)", op.query, ret.Elem().Interface(), ret.Elem().Interface(), op.expected, op.expected)
+		}
+	}
+}
+
+type sumAggregator int64
+
+func (s *sumAggregator) Step(x int64) {
+	*s += sumAggregator(x)
+}
+
+func (s *sumAggregator) Done() int64 {
+	return int64(*s)
+}
+
+func TestAggregatorRegistration(t *testing.T) {
+	customSum := func() *sumAggregator {
+		var ret sumAggregator
+		return &ret
+	}
+
+	sql.Register("sqlite3_AggregatorRegistration", &SQLiteDriver{
+		ConnectHook: func(conn *SQLiteConn) error {
+			return conn.RegisterAggregator("customSum", customSum, true)
+		},
+	})
+	db, err := sql.Open("sqlite3_AggregatorRegistration", ":memory:")
+	if err != nil {
+		t.Fatal("Failed to open database:", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("create table foo (department integer, profits integer)")
+	if err != nil {
+		// trace feature is not implemented
+		t.Skip("Failed to create table:", err)
+	}
+
+	_, err = db.Exec("insert into foo values (1, 10), (1, 20), (2, 42)")
+	if err != nil {
+		t.Fatal("Failed to insert records:", err)
+	}
+
+	tests := []struct {
+		dept, sum int64
+	}{
+		{1, 30},
+		{2, 42},
+	}
+
+	for _, test := range tests {
+		var ret int64
+		err = db.QueryRow("select customSum(profits) from foo where department = $1 group by department", test.dept).Scan(&ret)
+		if err != nil {
+			t.Fatal("Query failed:", err)
+		}
+		if ret != test.sum {
+			t.Fatalf("Custom sum returned wrong value, got %d, want %d", ret, test.sum)
 		}
 	}
 }
@@ -1271,11 +1487,11 @@ func TestCollationRegistration(t *testing.T) {
 
 	populate := []string{
 		`CREATE TABLE test (s TEXT)`,
-		`INSERT INTO test VALUES ("aaaa")`,
-		`INSERT INTO test VALUES ("ffff")`,
-		`INSERT INTO test VALUES ("qqqq")`,
-		`INSERT INTO test VALUES ("tttt")`,
-		`INSERT INTO test VALUES ("zzzz")`,
+		`INSERT INTO test VALUES ('aaaa')`,
+		`INSERT INTO test VALUES ('ffff')`,
+		`INSERT INTO test VALUES ('qqqq')`,
+		`INSERT INTO test VALUES ('tttt')`,
+		`INSERT INTO test VALUES ('zzzz')`,
 	}
 	for _, stmt := range populate {
 		if _, err := db.Exec(stmt); err != nil {
@@ -1370,7 +1586,7 @@ func TestDeclTypes(t *testing.T) {
 		t.Fatal("Failed to create table:", err)
 	}
 
-	_, err = sqlite3conn.Exec("insert into foo(name) values(\"bar\")", nil)
+	_, err = sqlite3conn.Exec("insert into foo(name) values('bar')", nil)
 	if err != nil {
 		t.Fatal("Failed to insert:", err)
 	}
@@ -1465,6 +1681,67 @@ func TestUpdateAndTransactionHooks(t *testing.T) {
 	}
 }
 
+func TestAuthorizer(t *testing.T) {
+	var authorizerReturn = 0
+
+	sql.Register("sqlite3_Authorizer", &SQLiteDriver{
+		ConnectHook: func(conn *SQLiteConn) error {
+			conn.RegisterAuthorizer(func(op int, arg1, arg2, arg3 string) int {
+				return authorizerReturn
+			})
+			return nil
+		},
+	})
+	db, err := sql.Open("sqlite3_Authorizer", ":memory:")
+	if err != nil {
+		t.Fatal("Failed to open database:", err)
+	}
+	defer db.Close()
+
+	statements := []string{
+		"create table foo (id integer primary key, name varchar)",
+		"insert into foo values (9, 'test9')",
+		"update foo set name = 'test99' where id = 9",
+		"select * from foo",
+	}
+
+	authorizerReturn = SQLITE_OK
+	for _, statement := range statements {
+		_, err = db.Exec(statement)
+		if err != nil {
+			t.Fatalf("No error expected [%v]: %v", statement, err)
+		}
+	}
+
+	authorizerReturn = SQLITE_DENY
+	for _, statement := range statements {
+		_, err = db.Exec(statement)
+		if err == nil {
+			t.Fatalf("Authorizer didn't worked - nil received, but error expected: [%v]", statement)
+		}
+	}
+}
+
+func TestNonColumnString(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var x interface{}
+	if err := db.QueryRow("SELECT 'hello'").Scan(&x); err != nil {
+		t.Fatal(err)
+	}
+	s, ok := x.(string)
+	if !ok {
+		t.Fatalf("non-column string must return string but got %T", x)
+	}
+	if s != "hello" {
+		t.Fatalf("non-column string must return %q but got %q", "hello", s)
+	}
+}
+
 func TestNilAndEmptyBytes(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
@@ -1520,6 +1797,64 @@ func TestNilAndEmptyBytes(t *testing.T) {
 	}
 }
 
+func TestInsertNilByteSlice(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("create table blob_not_null (b blob not null)"); err != nil {
+		t.Fatal(err)
+	}
+	var nilSlice []byte
+	if _, err := db.Exec("insert into blob_not_null (b) values (?)", nilSlice); err == nil {
+		t.Fatal("didn't expect INSERT to 'not null' column with a nil []byte slice to work")
+	}
+	zeroLenSlice := []byte{}
+	if _, err := db.Exec("insert into blob_not_null (b) values (?)", zeroLenSlice); err != nil {
+		t.Fatal("failed to insert zero-length slice")
+	}
+}
+
+func TestNamedParam(t *testing.T) {
+	tempFilename := TempFilename(t)
+	defer os.Remove(tempFilename)
+	db, err := sql.Open("sqlite3", tempFilename)
+	if err != nil {
+		t.Fatal("Failed to open database:", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("drop table foo")
+	_, err = db.Exec("create table foo (id integer, name text, amount integer)")
+	if err != nil {
+		t.Fatal("Failed to create table:", err)
+	}
+
+	_, err = db.Exec("insert into foo(id, name, amount) values(:id, @name, $amount)",
+		sql.Named("bar", 42), sql.Named("baz", "quux"),
+		sql.Named("amount", 123), sql.Named("corge", "waldo"),
+		sql.Named("id", 2), sql.Named("name", "grault"))
+	if err != nil {
+		t.Fatal("Failed to insert record with named parameters:", err)
+	}
+
+	rows, err := db.Query("select id, name, amount from foo")
+	if err != nil {
+		t.Fatal("Failed to select records:", err)
+	}
+	defer rows.Close()
+
+	rows.Next()
+
+	var id, amount int
+	var name string
+	rows.Scan(&id, &name, &amount)
+	if id != 2 || name != "grault" || amount != 123 {
+		t.Errorf("Expected %d, %q, %d for fetched result, but got %d, %q, %d:", 2, "grault", 123, id, name, amount)
+	}
+}
+
 var customFunctionOnce sync.Once
 
 func BenchmarkCustomFunctions(b *testing.B) {
@@ -1531,10 +1866,7 @@ func BenchmarkCustomFunctions(b *testing.B) {
 		sql.Register("sqlite3_BenchmarkCustomFunctions", &SQLiteDriver{
 			ConnectHook: func(conn *SQLiteConn) error {
 				// Impure function to force sqlite to reexecute it each time.
-				if err := conn.RegisterFunc("custom_add", customAdd, false); err != nil {
-					return err
-				}
-				return nil
+				return conn.RegisterFunc("custom_add", customAdd, false)
 			},
 		})
 	})
@@ -1556,25 +1888,21 @@ func BenchmarkCustomFunctions(b *testing.B) {
 }
 
 func TestSuite(t *testing.T) {
-	tempFilename := TempFilename(t)
-	defer os.Remove(tempFilename)
-	d, err := sql.Open("sqlite3", tempFilename+"?_busy_timeout=99999")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer d.Close()
+	initializeTestDB(t)
+	defer freeTestDB()
 
-	db = &TestDB{t, d, SQLITE, sync.Once{}}
-	testing.RunTests(func(string, string) (bool, error) { return true, nil }, tests)
-
-	if !testing.Short() {
-		for _, b := range benchmarks {
-			fmt.Printf("%-20s", b.Name)
-			r := testing.Benchmark(b.F)
-			fmt.Printf("%10d %10.0f req/s\n", r.N, float64(r.N)/r.T.Seconds())
-		}
+	for _, test := range tests {
+		t.Run(test.Name, test.F)
 	}
-	db.tearDown()
+}
+
+func BenchmarkSuite(b *testing.B) {
+	initializeTestDB(b)
+	defer freeTestDB()
+
+	for _, benchmark := range benchmarks {
+		b.Run(benchmark.Name, benchmark.F)
+	}
 }
 
 // Dialect is a type of dialect of databases.
@@ -1589,13 +1917,36 @@ const (
 
 // DB provide context for the tests
 type TestDB struct {
-	*testing.T
+	testing.TB
 	*sql.DB
-	dialect Dialect
-	once    sync.Once
+	dialect      Dialect
+	once         sync.Once
+	tempFilename string
 }
 
 var db *TestDB
+
+func initializeTestDB(t testing.TB) {
+	tempFilename := TempFilename(t)
+	d, err := sql.Open("sqlite3", tempFilename+"?_busy_timeout=99999")
+	if err != nil {
+		os.Remove(tempFilename)
+		t.Fatal(err)
+	}
+
+	db = &TestDB{t, d, SQLITE, sync.Once{}, tempFilename}
+}
+
+func freeTestDB() {
+	err := db.DB.Close()
+	if err != nil {
+		panic(err)
+	}
+	err = os.Remove(db.tempFilename)
+	if err != nil {
+		panic(err)
+	}
+}
 
 // the following tables will be created and dropped during the test
 var testTables = []string{"foo", "bar", "t", "bench"}
@@ -1603,9 +1954,12 @@ var testTables = []string{"foo", "bar", "t", "bench"}
 var tests = []testing.InternalTest{
 	{Name: "TestResult", F: testResult},
 	{Name: "TestBlobs", F: testBlobs},
+	{Name: "TestMultiBlobs", F: testMultiBlobs},
+	{Name: "TestNullZeroLengthBlobs", F: testNullZeroLengthBlobs},
 	{Name: "TestManyQueryRow", F: testManyQueryRow},
 	{Name: "TestTxQuery", F: testTxQuery},
 	{Name: "TestPreparedStmt", F: testPreparedStmt},
+	{Name: "TestExecEmptyQuery", F: testExecEmptyQuery},
 }
 
 var benchmarks = []testing.InternalBenchmark{
@@ -1641,7 +1995,7 @@ func (db *TestDB) tearDown() {
 // q replaces ? parameters if needed
 func (db *TestDB) q(sql string) string {
 	switch db.dialect {
-	case POSTGRESQL: // repace with $1, $2, ..
+	case POSTGRESQL: // replace with $1, $2, ..
 		qrx := regexp.MustCompile(`\?`)
 		n := 0
 		return qrx.ReplaceAllStringFunc(sql, func(string) string {
@@ -1758,6 +2112,86 @@ func testBlobs(t *testing.T) {
 	}
 }
 
+func testMultiBlobs(t *testing.T) {
+	db.tearDown()
+	db.mustExec("create table foo (id integer primary key, bar " + db.blobType(16) + ")")
+	var blob0 = []byte{0, 1, 2, 3, 4, 5, 6, 7}
+	db.mustExec(db.q("insert into foo (id, bar) values(?,?)"), 0, blob0)
+	var blob1 = []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	db.mustExec(db.q("insert into foo (id, bar) values(?,?)"), 1, blob1)
+
+	r, err := db.Query(db.q("select bar from foo order by id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if !r.Next() {
+		if r.Err() != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("expected one rows")
+	}
+
+	want0 := fmt.Sprintf("%x", blob0)
+	b0 := make([]byte, 8)
+	err = r.Scan(&b0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got0 := fmt.Sprintf("%x", b0)
+
+	if !r.Next() {
+		if r.Err() != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("expected one rows")
+	}
+
+	want1 := fmt.Sprintf("%x", blob1)
+	b1 := make([]byte, 16)
+	err = r.Scan(&b1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got1 := fmt.Sprintf("%x", b1)
+	if got0 != want0 {
+		t.Errorf("for []byte, got %q; want %q", got0, want0)
+	}
+	if got1 != want1 {
+		t.Errorf("for []byte, got %q; want %q", got1, want1)
+	}
+}
+
+// testBlobs tests that we distinguish between null and zero-length blobs
+func testNullZeroLengthBlobs(t *testing.T) {
+	db.tearDown()
+	db.mustExec("create table foo (id integer primary key, bar " + db.blobType(16) + ")")
+	db.mustExec(db.q("insert into foo (id, bar) values(?,?)"), 0, nil)
+	db.mustExec(db.q("insert into foo (id, bar) values(?,?)"), 1, []byte{})
+
+	r0 := db.QueryRow(db.q("select bar from foo where id=0"))
+	var b0 []byte
+	err := r0.Scan(&b0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b0 != nil {
+		t.Errorf("for id=0, got %x; want nil", b0)
+	}
+
+	r1 := db.QueryRow(db.q("select bar from foo where id=1"))
+	var b1 []byte
+	err = r1.Scan(&b1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b1 == nil {
+		t.Error("for id=1, got nil; want zero-length slice")
+	} else if len(b1) > 0 {
+		t.Errorf("for id=1, got %x; want zero-length slice", b1)
+	}
+}
+
 // testManyQueryRow is test for many query row
 func testManyQueryRow(t *testing.T) {
 	if testing.Short() {
@@ -1854,6 +2288,25 @@ func testPreparedStmt(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// testEmptyQuery is test for validating the API in case of empty query
+func testExecEmptyQuery(t *testing.T) {
+	db.tearDown()
+	res, err := db.Exec(" -- this is just a comment ")
+	if err != nil {
+		t.Fatalf("empty query err: %v", err)
+	}
+
+	_, err = res.LastInsertId()
+	if err != nil {
+		t.Fatalf("LastInsertId returned an error: %v", err)
+	}
+
+	_, err = res.RowsAffected()
+	if err != nil {
+		t.Fatalf("RowsAffected returned an error: %v", err)
+	}
 }
 
 // Benchmarks need to use panic() since b.Error errors are lost when
