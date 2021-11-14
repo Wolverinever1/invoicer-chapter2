@@ -195,6 +195,8 @@ func (iv *invoicer) putInvoice(w http.ResponseWriter, r *http.Request) {
 	al.log(r)
 }
 
+var CSRFKey []byte
+
 func checkCSRFToken(token string) bool {
 	mac := hmac.New(sha256.New, CSRFKey)
 	tokenParts := strings.Split(token, "$")
